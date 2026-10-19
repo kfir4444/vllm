@@ -195,6 +195,29 @@ def process_weights_after_loading(
             # the caching allocator, which starves the OS on UMA devices.
             release_device_memory_under_pressure(target_device)
 
+    refresh_weight_derived_state(model, model_config, target_device)
+
+    # Needed for torchao model reloading via model.reload_weights
+    # @kylesayrs @jerryzh168 this can be removed if callers move to `reload_weights`
+    if model_config.quantization == "torchao":
+        set_torchao_reload_attrs(model, model_config)
+
+
+def refresh_weight_derived_state(
+    model: nn.Module, model_config: ModelConfig, target_device: torch.device
+) -> None:
+    """Recompute state that is derived from the final (processed) weights.
+
+    This is the part of ``process_weights_after_loading`` that only *reads*
+    processed weights: attention-layer and model-level post-load hooks. They
+    build tensors that are not in ``state_dict()`` (e.g. DeepSeek-V4
+    ``hc_attn_fn_broadcast`` from ``hc_attn_fn``), so anything that overwrites
+    weights in place after the model was post-processed must call this again,
+    or those tensors keep the values of the old weights. It never touches
+    quant methods, so it is safe to call on a live model.
+
+    Hooks run here must be idempotent and recompute from weights only.
+    """
     # Initialize post-load attention weights for any attention layer and MM
     # encoder. NOTE: Happens after other modules so we can easily decompress
     # weights.
@@ -208,11 +231,6 @@ def process_weights_after_loading(
     # Model-level post-load hook, after the per-layer quant finalize.
     if hasattr(model, "process_weights_after_loading"):
         model.process_weights_after_loading()
-
-    # Needed for torchao model reloading via model.reload_weights
-    # @kylesayrs @jerryzh168 this can be removed if callers move to `reload_weights`
-    if model_config.quantization == "torchao":
-        set_torchao_reload_attrs(model, model_config)
 
 
 @contextmanager

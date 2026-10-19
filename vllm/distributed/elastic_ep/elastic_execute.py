@@ -46,6 +46,7 @@ from vllm.model_executor.layers.fused_moe.config import FusedMoEParallelConfig
 from vllm.model_executor.layers.fused_moe.eep_reconfigure import (
     make_eep_staged_quant_method,
 )
+from vllm.model_executor.model_loader.utils import refresh_weight_derived_state
 from vllm.model_executor.warmup.flashinfer_autotune_cache import (
     sync_flashinfer_autotune_cache,
 )
@@ -676,6 +677,13 @@ class ElasticEPScalingExecutor:
             peer_rank=sender_rank,
             dp_group=dp_group,
             expert_weights=expert_weights,
+        )
+        torch.accelerator.synchronize()
+        # The model was post-processed with dummy weights, so tensors derived
+        # from weights but absent from state_dict() are stale; the transfer
+        # above did not carry them. Recompute them from the received weights.
+        refresh_weight_derived_state(
+            model, self.worker.model_config, self.worker.device
         )
         torch.accelerator.synchronize()
         if not current_platform.is_rocm():
