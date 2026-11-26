@@ -12,7 +12,6 @@ from typing import Any, overload
 import torch
 
 from vllm.platforms import current_platform
-from vllm.utils.torch_utils import is_torch_equal_or_newer
 
 _weights_pre_processed: ContextVar[bool] = ContextVar(
     "weights_pre_processed", default=False
@@ -22,8 +21,8 @@ _weights_pre_processed: ContextVar[bool] = ContextVar(
 @contextmanager
 def weights_already_processed():
     """Mark that weights are already in post-processed (runtime) format, so
-    `process_weights_after_loading` skips tensor transforms (used by the
-    weight cache IPC loader).
+    `process_weights_after_loading` skips tensor transforms (weight cache
+    loaders, elastic EP scale-up).
     """
     token = _weights_pre_processed.set(True)
     try:
@@ -34,6 +33,26 @@ def weights_already_processed():
 
 def is_weights_pre_processed() -> bool:
     return _weights_pre_processed.get()
+
+
+_weights_from_peers: ContextVar[bool] = ContextVar("weights_from_peers", default=False)
+
+
+@contextmanager
+def weights_from_peers():
+    """Mark a load whose weights are then overwritten by tensors received from
+    peer ranks (elastic EP scale-up), so post-load processing must not run
+    collectives that the peers do not join.
+    """
+    token = _weights_from_peers.set(True)
+    try:
+        yield
+    finally:
+        _weights_from_peers.reset(token)
+
+
+def are_weights_from_peers() -> bool:
+    return _weights_from_peers.get()
 
 
 def set_weight_attrs(
@@ -76,12 +95,21 @@ def _is_integrated_gpu(device: torch.device) -> bool:
     return device.type == "cuda" and current_platform.is_integrated_gpu(device.index)
 
 
+# 1-byte dtypes whose bytes are the value (raw bytes, MX scales, packed FP4)
+_BYTE_CONTAINERS = frozenset(
+    {torch.uint8, torch.int8, torch.float8_e8m0fnu, torch.float4_e2m1fn_x2}
+)
+
+
 def copy_weight_(dst: torch.Tensor, src: torch.Tensor) -> torch.Tensor:
     """`dst.copy_(src)` for weight loaders.
 
     Model-specific weight loaders should call this instead of `.copy_()` when
     copying a checkpoint tensor to the device. Off integrated GPUs it is a
-    plain `copy_`.
+    plain `copy_`, except that a copy between two byte containers (`uint8`,
+    `int8`, `float8_e8m0fnu`, `float4_e2m1fn_x2`) keeps the bytes, where
+    `copy_` would convert E8M0 scales by value. Float8 value formats still
+    convert by value.
 
     On integrated GPUs, a host-to-device copy straight from a safetensors mmap
     takes its page faults inside the driver copy, which is several times slower
@@ -90,6 +118,12 @@ def copy_weight_(dst: torch.Tensor, src: torch.Tensor) -> torch.Tensor:
     a CPU temporary. Sources with at most one element are skipped: they count
     as contiguous with any stride, which `view(torch.uint8)` rejects.
     """
+    if (
+        src.dtype != dst.dtype
+        and src.dtype in _BYTE_CONTAINERS
+        and dst.dtype in _BYTE_CONTAINERS
+    ):
+        src = src.view(dst.dtype)
     if (
         src.device.type == "cpu"
         and src.dtype == dst.dtype
@@ -240,12 +274,9 @@ def replace_parameter(
         elif getattr(getattr(layer, "quant_method", None), "uses_meta_device", False):
             old_param.data = new_tensor  # online quantization frees the source
         else:
-            from vllm.model_executor.model_loader.reload.direct import (
-                direct_reload_enabled,
-            )
-
+            # a recorded checkpoint layout must keep its storage across reloads
             old_param.data = _in_own_storage(
-                old_param, new_tensor, whole_storage=direct_reload_enabled()
+                old_param, new_tensor, whole_storage=hasattr(old_param, "_ckpt")
             )
         for attr_name, attr in new_tensor_attrs.items():
             setattr(old_param, attr_name, attr)
@@ -396,7 +427,7 @@ def get_moe_expert_mapping(
 
 
 def maybe_disable_graph_partition(current_backend: str) -> dict[str, bool]:
-    if current_backend == "inductor" and is_torch_equal_or_newer("2.9.0.dev"):
+    if current_backend == "inductor":
         return {"graph_partition": False}
     else:
         return {}
